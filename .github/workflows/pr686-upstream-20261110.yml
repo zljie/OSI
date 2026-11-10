@@ -1,0 +1,196 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+name: PR 686 history and audit validation
+on:
+  push:
+    branches: ['verify/pr686-upstream-20261110']
+permissions:
+  contents: read
+concurrency:
+  group: pr686-20261110
+  cancel-in-progress: false
+env:
+  ORIGINAL: 0f0fdde4162881224f4febf28a76db41b2d8f6fd
+  UPSTREAM: d700cdeac41d15a7004eb2f9b0b38a2b1d517a18
+  ORIGINAL_BRANCH: docs/spec-change-history-20261102
+  CANDIDATE_BRANCH: verify/pr686-tested-20261110
+jobs:
+  validate:
+    if: github.repository == 'zljie/OSI'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13', '3.14']
+    env:
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          version: '0.12.19'
+      - name: Pin sources and preserve test tools
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence" "$RUNNER_TEMP/tools"
+          cp .pr686-validation/*.py "$RUNNER_TEMP/tools/"
+          git config user.name zljie
+          git config user.email '44569452+zljie@users.noreply.github.com'
+          git fetch --no-tags https://github.com/apache/ossie.git "$UPSTREAM"
+          git checkout --detach "$UPSTREAM"
+      - name: Test upstream baseline
+        run: |
+          set -euo pipefail
+          uv run --with pytest --with pyyaml --with jsonschema --with sqlglot -m pytest -q validation/tests/ --junitxml="$RUNNER_TEMP/evidence/baseline-validation.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/baseline-validation.log"
+          uv run --with pytest --with jsonschema --with ./python -m pytest -q python/tests/ --junitxml="$RUNNER_TEMP/evidence/baseline-models.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/baseline-models.log"
+      - name: Reproduce and resolve document conflicts
+        run: |
+          set -euo pipefail
+          git checkout --detach "$ORIGINAL"
+          python "$RUNNER_TEMP/tools/prepare.py" "$RUNNER_TEMP/evidence/prepared.json" "$RUNNER_TEMP/tools/test_audit_spec_changes.py"
+      - name: Test audit and run against real upstream history
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s scripts/tests -p test_audit_spec_changes.py -v 2>&1 | tee "$RUNNER_TEMP/evidence/audit-tests.log"
+          python scripts/audit-spec-changes.py --since 2026-09-01 --git-ref "$UPSTREAM" | tee "$RUNNER_TEMP/evidence/audit-upstream.log"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          output = (Path(os.environ['RUNNER_TEMP'])/'evidence/audit-upstream.log').read_text()
+          assert 'Recorded significant PRs: 9;' in output
+          assert '/pull/691 ' not in output
+          PY
+      - name: Test integrated validation and Python models
+        run: |
+          set -euo pipefail
+          uv run --with pytest --with pyyaml --with jsonschema --with sqlglot -m pytest -q validation/tests/ --junitxml="$RUNNER_TEMP/evidence/integration-validation.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/integration-validation.log"
+          uv run --with pytest --with jsonschema --with ./python -m pytest -q python/tests/ --junitxml="$RUNNER_TEMP/evidence/integration-models.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/integration-models.log"
+      - name: Check duplicate-key validator, generated types and canonical examples
+        run: |
+          set -euo pipefail
+          {
+            uv run validation/test_validate.py
+            uv run scripts/generate-spec-types.py --check
+            uv run validation/validate.py examples/tpcds_semantic_model.yaml
+            uv run validation/validate.py examples/flights.yaml --schema ontology/ontology.json
+            uv run validation/validate.py examples/flights.ontology.yaml --schema ontology/ontology.json
+            uv run validation/validate.py examples/flights.semantic_model.yaml
+            uv run validation/validate.py examples/flights.mapping.yaml --schema ontology/mapping.json
+            uv run validation/validate.py examples/renamed_fields.yaml
+          } 2>&1 | tee "$RUNNER_TEMP/evidence/additional-checks.log"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p = Path(os.environ['RUNNER_TEMP'])/'evidence/prepared.json'
+          data = json.loads(p.read_text())
+          data.update(passed=True, python='${{ matrix.python }}')
+          p.write_text(json.dumps(data, indent=2)+'\n')
+          PY
+      - name: Collect patch and exact tree
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/evidence"
+          git status --porcelain > "$RUNNER_TEMP/evidence/status.txt"
+          git diff --name-only --diff-filter=U > "$RUNNER_TEMP/evidence/conflicts.txt"
+          if test -f "$RUNNER_TEMP/evidence/prepared.json"; then
+            git diff --cached "$UPSTREAM" --binary > "$RUNNER_TEMP/evidence/integration.patch"
+            git diff --cached --name-only -z "$UPSTREAM" | tar --null -T - -czf "$RUNNER_TEMP/evidence/changed-files.tar.gz"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: pr686-20261110-python-${{ matrix.python }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 14
+          if-no-files-found: error
+  publish-candidate:
+    needs: validate
+    if: github.repository == 'zljie/OSI'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Rebuild and compare four passing evidence records
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'pr686-20261110-python-*' --dir "$RUNNER_TEMP/validated"
+          mkdir -p "$RUNNER_TEMP/publication" "$RUNNER_TEMP/tools"
+          cp .pr686-validation/*.py "$RUNNER_TEMP/tools/"
+          test "$(git ls-remote origin "refs/heads/$ORIGINAL_BRANCH" | cut -f1)" = "$ORIGINAL"
+          test "$(git ls-remote origin "refs/heads/$CANDIDATE_BRANCH" | cut -f1)" = "$UPSTREAM"
+          test "$(git ls-remote https://github.com/apache/ossie.git refs/heads/main | cut -f1)" = "$UPSTREAM"
+          git config user.name zljie
+          git config user.email '44569452+zljie@users.noreply.github.com'
+          git fetch --no-tags https://github.com/apache/ossie.git "$UPSTREAM"
+          git checkout --detach "$ORIGINAL"
+          python "$RUNNER_TEMP/tools/prepare.py" "$RUNNER_TEMP/publication/prepared.json" "$RUNNER_TEMP/tools/test_audit_spec_changes.py"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          root = Path(os.environ['RUNNER_TEMP'])
+          expected = json.loads((root/'publication/prepared.json').read_text())
+          records = list((root/'validated').glob('*/prepared.json'))
+          assert len(records) == 4
+          versions = set()
+          for path in records:
+              record = json.loads(path.read_text())
+              assert record['passed'] is True
+              versions.add(record['python'])
+              for key in ('original','upstream','tree','files','conflicts_reproduced'):
+                  assert record[key] == expected[key], (key, path)
+              for name in ('baseline-validation.xml','baseline-models.xml','integration-validation.xml','integration-models.xml'):
+                  report = ET.parse(path.parent/name).getroot()
+                  assert list(report.iter('testcase'))
+                  assert not list(report.iter('failure')) and not list(report.iter('error'))
+              audit = (path.parent/'audit-tests.log').read_text()
+              assert 'Ran 12 tests' in audit and '\nOK' in audit
+          assert versions == {'3.11','3.12','3.13','3.14'}
+          print('All matrices verified the identical tree:', expected['tree'])
+          PY
+      - name: Publish tested candidate only
+        run: |
+          set -euo pipefail
+          git diff --cached --check
+          git commit -m 'Merge upstream 0.3 development history and verify advisory audit'
+          test "$(git show -s --format=%P HEAD)" = "$ORIGINAL $UPSTREAM"
+          git diff --quiet "$UPSTREAM" HEAD -- .github/workflows python validation core-spec/ossie-schema.json ontology/ontology.json ontology/mapping.json
+          test "$(git ls-remote origin "refs/heads/$ORIGINAL_BRANCH" | cut -f1)" = "$ORIGINAL"
+          test "$(git ls-remote origin "refs/heads/$CANDIDATE_BRANCH" | cut -f1)" = "$UPSTREAM"
+          git push origin "HEAD:refs/heads/$CANDIDATE_BRANCH"
+          git rev-parse HEAD > "$RUNNER_TEMP/publication/candidate-sha.txt"
+          git show -s --format='%H %T %P' HEAD > "$RUNNER_TEMP/publication/commit-tree-parents.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: pr686-20261110-publication
+          path: ${{ runner.temp }}/publication/
+          retention-days: 14
