@@ -1,0 +1,147 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+name: PR 711 audit coverage verification
+on:
+  push:
+    branches: ['verify/pr711-audit-coverage-20261111']
+permissions:
+  contents: read
+env:
+  REVIEW_HEAD: 7391337aa044a23011eef33bd17842e6f445c41f
+  REVIEW_BASE: ee89dbdc2844d8b7d293ed42c8613928bb99505f
+jobs:
+  verify:
+    if: github.repository == 'zljie/OSI'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          version: '0.12.19'
+      - name: Pin maintainer code without changing any PR branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tools" "$RUNNER_TEMP/evidence"
+          cp .p1-audit/test_audit_history_graphs.py "$RUNNER_TEMP/tools/"
+          git fetch --no-tags https://github.com/jbonofre/ossie.git "$REVIEW_HEAD"
+          git checkout --detach "$REVIEW_HEAD"
+          test "$(git hash-object scripts/audit-spec-changes.py)" = bad90e702705620d81a5d38f20c472802edfcd75
+          git --version > "$RUNNER_TEMP/evidence/git-version.txt"
+          cp scripts/audit-spec-changes.py "$RUNNER_TEMP/evidence/audit-before.py"
+      - name: Run the original PR 711 tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --no-project --python '${{ matrix.python }}' --with 'pytest==9.2.0' python -m pytest -q scripts/tests/ --junitxml="$RUNNER_TEMP/evidence/baseline.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/baseline.log"
+      - name: Require the ordinary-merge coverage gaps in the unmodified audit
+        shell: bash
+        run: |
+          set -euo pipefail
+          export AUDIT_SCRIPT="$GITHUB_WORKSPACE/scripts/audit-spec-changes.py"
+          set +e
+          uv run --no-project --python '${{ matrix.python }}' --with 'pytest==9.2.0' python -m pytest -q "$RUNNER_TEMP/tools/test_audit_history_graphs.py" --junitxml="$RUNNER_TEMP/evidence/red.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/red.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" = 1
+          python - <<'PY'
+          import json, os, xml.etree.ElementTree as ET
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'evidence'
+          report = ET.parse(root / 'red.xml').getroot()
+          failed = {c.attrib['name'] for c in report.iter('testcase') if c.find('failure') is not None}
+          expected = {f'test_expected_pr_sets_from_actual_commit_graphs[{cwd}-{kind}]' for cwd in ('root','subdirectory') for kind in ('ordinary','diverged_main','feature_synced_main','nested_merges')}
+          assert not list(report.iter('error')) and not list(report.iter('skipped'))
+          assert failed == expected, failed
+          (root / 'reproduction.json').write_text(json.dumps({'defect_reproduced':True,'failed':sorted(failed),'tests':len(list(report.iter('testcase')))},indent=2))
+          PY
+      - name: Record real history before candidate change
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/audit-spec-changes.py --git-ref "$REVIEW_HEAD" > "$RUNNER_TEMP/evidence/head-before.log"
+          python scripts/audit-spec-changes.py --git-ref "$REVIEW_BASE" > "$RUNNER_TEMP/evidence/base-before.log"
+      - name: Apply one-line show-pulls candidate and add real-graph regressions locally only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/audit-spec-changes.py')
+          text = path.read_text()
+          old = '["git", "-C", str(root), "log", f"--since={args.since} 00:00:00 +0000",'
+          assert text.count(old) == 1
+          path.write_text(text.replace(old, '["git", "-C", str(root), "log", "--show-pulls", f"--since={args.since} 00:00:00 +0000",'))
+          PY
+          cp "$RUNNER_TEMP/tools/test_audit_history_graphs.py" scripts/tests/test_audit_history_graphs.py
+      - name: Run all existing and new tests against the candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --no-project --python '${{ matrix.python }}' --with 'pytest==9.2.0' python -m pytest -q scripts/tests/ --junitxml="$RUNNER_TEMP/evidence/green.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/green.log"
+          python scripts/audit-spec-changes.py --git-ref "$REVIEW_HEAD" > "$RUNNER_TEMP/evidence/head-after.log"
+          python scripts/audit-spec-changes.py --git-ref "$REVIEW_BASE" > "$RUNNER_TEMP/evidence/base-after.log"
+          (cd core-spec && python ../scripts/audit-spec-changes.py --git-ref "$REVIEW_HEAD") > "$RUNNER_TEMP/evidence/subdirectory-after.log"
+          python - <<'PY'
+          import json, os, re, subprocess, xml.etree.ElementTree as ET
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'evidence'
+          def ids(name):
+              return {int(n) for n in re.findall(r'/pull/(\d+) ', (root / name).read_text())}
+          report = ET.parse(root / 'green.xml').getroot()
+          assert not list(report.iter('failure')) and not list(report.iter('error')) and not list(report.iter('skipped'))
+          assert ids('head-before.log') <= ids('head-after.log')
+          assert ids('base-before.log') <= ids('base-after.log')
+          assert ids('head-after.log') == ids('subdirectory-after.log')
+          record = {'review_head':os.environ['REVIEW_HEAD'],'review_base':os.environ['REVIEW_BASE'],
+                    'python':'${{ matrix.python }}','all_tests_passed':True,'tests':len(list(report.iter('testcase'))),
+                    'head_before':sorted(ids('head-before.log')),'head_after':sorted(ids('head-after.log')),
+                    'base_before':sorted(ids('base-before.log')),'base_after':sorted(ids('base-after.log')),
+                    'published_to_upstream':False,'maintainer_branch_modified':False}
+          (root / 'verification.json').write_text(json.dumps(record,indent=2)+'\n')
+          print(json.dumps(record,indent=2))
+          PY
+      - name: Collect proposed patch without publishing a replacement PR
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp scripts/audit-spec-changes.py "$RUNNER_TEMP/evidence/audit-after.py"
+          if test -f scripts/tests/test_audit_history_graphs.py; then
+            cp scripts/tests/test_audit_history_graphs.py "$RUNNER_TEMP/evidence/"
+            git add scripts/audit-spec-changes.py scripts/tests/test_audit_history_graphs.py
+            git diff --cached --check
+            git diff --cached --binary > "$RUNNER_TEMP/evidence/proposed.patch"
+          fi
+          git status --porcelain > "$RUNNER_TEMP/evidence/status.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: pr711-audit-python-${{ matrix.python }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 14
